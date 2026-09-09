@@ -109,10 +109,9 @@ async def generate_response(system_prompt: str, user_message: str) -> str:
     total_tokens = token_usage.get("total_tokens", 0)
     token_tracker.add_tokens(total_tokens)
 
-    print(f"Response content:\n{response.content}")
+    total_tokens = token_usage.get("total_tokens", 0)
     print(f"Total tokens used: {total_tokens}")
-    print(f"Token usage summary:\n{token_tracker.get_summary()}")
-
+    print(f"Response content:\n{response.content}")
     return response.content
 
 
@@ -143,8 +142,8 @@ async def main():
         # 7. In the end print info about usage, you will be impressed of how many tokens you have used. (imagine if we have 10k or 100k users 😅)
 
         user_client = UserClient()
-        all_users = user_client.get_all_users()[:100]  # Limit to 1000 users for testing
-        user_batches = [all_users[i : i + 10] for i in range(0, len(all_users), 100)]
+        all_users = user_client.get_all_users()  # Limit to 1000 users for testing
+        user_batches = [all_users[i : i + 100] for i in range(0, len(all_users), 100)]
         for batch in user_batches:
             print(f"Batch size: {len(batch)}")
             gathered_responses = await asyncio.gather(
@@ -172,6 +171,10 @@ async def main():
                 print("\n--- Final Response ---")
                 print(final_response)
                 break
+        else:
+            print("No users found matching the search criteria.")
+
+        print(f"Token usage summary:\n{token_tracker.get_summary()}")
 
 
 if __name__ == "__main__":
