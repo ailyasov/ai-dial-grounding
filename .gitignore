@@ -1,0 +1,4 @@
+.codemie/
+.vscode/
+docs/
+task/t2/__pycache__/
