@@ -1,32 +1,38 @@
 import asyncio
 from typing import Any
+
 from langchain_community.vectorstores import FAISS
-from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.documents import Document
-from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
-from pydantic import SecretStr
-from task._constants import DIAL_URL, API_KEY
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+
+from task._constants import API_KEY, DIAL_URL
 from task.user_client import UserClient
 
-#TODO:
+# TODO:
 # Before implementation open the `vector_based_grounding.png` to see the flow of app
 
-#TODO:
+# TODO:
 # Provide System prompt. Goal is to explain LLM that in the user message will be provide rag context that is retrieved
 # based on user question and user question and LLM need to answer to user based on provided context
 SYSTEM_PROMPT = """
+Uou are a RAG-powered assistant that assists users with their questions about user information.
+Answer ONLY based on conversation history and RAG context.
 """
 
-#TODO:
+# TODO:
 # Should consist retrieved context and user question
 USER_PROMPT = """
+## RAG CONTEXT:
+{context}
+User QUESTION:
+{query}
 """
 
 
 def format_user_document(user: dict[str, Any]) -> str:
-    #TODO:
+    # TODO:
     # Prepare context from users JSONs in the same way as in `no_grounding.py` `join_context` method (collect as one string)
-    raise NotImplementedError
+    return "User:\n" + "\n".join(f"  {key}: {value}" for key, value in user.items())
 
 
 class UserRAG:
@@ -37,18 +43,26 @@ class UserRAG:
 
     async def __aenter__(self):
         print("🔎 Loading all users...")
-        #TODO:
+        # TODO:
         # 1. Get all users (use UserClient)
         # 2. Prepare array of Documents where page_content is `format_user_document(user)` (you need to iterate through users)
         # 3. call `_create_vectorstore_with_batching` (don't forget that its async) and setup it as obj var `vectorstore`
+        user_client = UserClient()
+        users = user_client.get_all_users()
+        documents = [
+            Document(page_content=format_user_document(user)) for user in users
+        ]
+        self.vectorstore = await self._create_vectorstore_with_batching(documents)
         print("✅ Vectorstore is ready.")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         pass
 
-    async def _create_vectorstore_with_batching(self, documents: list[Document], batch_size: int = 100):
-        #TODO:
+    async def _create_vectorstore_with_batching(
+        self, documents: list[Document], batch_size: int = 100
+    ):
+        # TODO:
         # 1. Split all `documents` on batches (100 documents in 1 batch). We need it since Embedding models have limited context window
         # 2. Iterate through document batches and create array with tasks that will generate FAISS vector stores from documents:
         #    https://api.python.langchain.com/en/latest/vectorstores/langchain_community.vectorstores.faiss.FAISS.html#langchain_community.vectorstores.faiss.FAISS.afrom_documents
@@ -56,40 +70,84 @@ class UserRAG:
         # 4. Create `final_vectorstore` via merge of all vector stores:
         #    https://api.python.langchain.com/en/latest/vectorstores/langchain_community.vectorstores.faiss.FAISS.html#langchain_community.vectorstores.faiss.FAISS.merge_from
         # 6. Return `final_vectorstore`
-        raise NotImplementedError
+        if not documents:
+            raise ValueError("Cannot create a vector store without user documents.")
 
-    async def retrieve_context(self, query: str, k: int = 10, score: float = 0.1) -> str:
-        #TODO:
+        tasks = [
+            FAISS.afrom_documents(documents[i : i + batch_size], self.embeddings)
+            for i in range(0, len(documents), batch_size)
+        ]
+        vectorstores = await asyncio.gather(*tasks)
+        final_vectorstore = vectorstores[0]
+        for vectorstore in vectorstores[1:]:
+            final_vectorstore.merge_from(vectorstore)
+        return final_vectorstore
+
+    async def retrieve_context(
+        self, query: str, k: int = 10, score: float = 0.1
+    ) -> str:
+        # TODO:
         # 1. Make similarity search:
         #    https://api.python.langchain.com/en/latest/vectorstores/langchain_community.vectorstores.faiss.FAISS.html#langchain_community.vectorstores.faiss.FAISS.similarity_search_with_relevance_scores
         # 2. Create `context_parts` empty array (we will collect content here)
         # 3. Iterate through retrieved relevant docs (pay attention that its tuple (doc, relevance_score)) and:
         #       - add doc page content to `context_parts` and then print score and content
         # 4. Return joined context from `context_parts` with `\n\n` spliterator (to enhance readability)
-        raise NotImplementedError
+        context_parts = []
+        relevant_docs = self.vectorstore.similarity_search_with_relevance_scores(
+            query, k=k
+        )
+        for doc, score in relevant_docs:
+            context_parts.append(doc.page_content)
+            # print(f"Score: {score}, Content: {doc.page_content}")
+        return "\n\n".join(context_parts)
 
     def augment_prompt(self, query: str, context: str) -> str:
         # TODO: Make augmentation for USER_PROMPT via `format` method
-        raise NotImplementedError
+        # 1. Print augmented prompt
+        # 2. Return augmented prompt
+        augmented_prompt = USER_PROMPT.format(context=context, query=query)
+        print(f"Augmented prompt:\n{augmented_prompt}")
+        return augmented_prompt
 
     def generate_answer(self, augmented_prompt: str) -> str:
-        #TODO:
+        # TODO:
         # 1. Create messages array with:
         #       - system prompt
         #       - user prompt
         # 2. Generate response
         #    https://python.langchain.com/api_reference/openai/chat_models/langchain_openai.chat_models.azure.AzureChatOpenAI.html#langchain_openai.chat_models.azure.AzureChatOpenAI.invoke
         # 3. Return response content
-        raise NotImplementedError
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": augmented_prompt},
+        ]
+        response = self.llm_client.invoke(messages)
+        return response.content
 
 
 async def main():
 
-    #TODO:
+    # TODO:
     # 1. Create AzureOpenAIEmbeddings
     #    embedding model 'text-embedding-3-small-1'
     #    I would recommend to set up dimensions as 384
     # 2. Create AzureChatOpenAI
+
+    #    chat model 'gpt-35-turbo'
+    #    I would recommend to set up temperature as 0.0
+    embeddings = AzureOpenAIEmbeddings(
+        deployment="text-embedding-3-small-1",
+        azure_endpoint=DIAL_URL,
+        openai_api_key=API_KEY,
+        openai_api_version="2024-02-01",
+    )
+    llm_client = AzureChatOpenAI(
+        deployment_name="gpt-4o",
+        openai_api_version="2024-02-01",
+        azure_endpoint=DIAL_URL,
+        openai_api_key=API_KEY,
+    )
 
     async with UserRAG(embeddings, llm_client) as rag:
         print("Query samples:")
@@ -97,16 +155,20 @@ async def main():
         print(" - Who is John?")
         while True:
             user_question = input("> ").strip()
-            if user_question.lower() in ['quit', 'exit']:
+            if user_question.lower() in ["quit", "exit"]:
                 break
-            #TODO:
+            # TODO:
             # 1. Retrieve context
             # 2. Make augmentation
             # 3. Generate answer and print it
-            raise NotImplementedError
+            context = await rag.retrieve_context(user_question)
+            augmented_prompt = rag.augment_prompt(user_question, context)
+            answer = rag.generate_answer(augmented_prompt)
+            print(f"Answer:\n{answer}")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
 
 # The problems with Vector based Grounding approach are:
 #   - In current solution we fetched all users once, prepared Vector store (Embed takes money) but we didn't play
