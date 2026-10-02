@@ -5,6 +5,10 @@ import requests
 from task._constants import USER_SERVICE_ENDPOINT
 
 
+class UserNotFoundError(requests.HTTPError):
+    """Raised when a requested user no longer exists in the User Service."""
+
+
 class UserClient:
     def get_all_users(self) -> list[dict[str, Any]]:
         headers = {"Content-Type": "application/json"}
@@ -31,7 +35,13 @@ class UserClient:
             data = response.json()
             return data
 
-        raise Exception(f"HTTP {response.status_code}: {response.text}")
+        if response.status_code == 404:
+            error = UserNotFoundError(f"User {id} was not found")
+            error.response = response
+            raise error
+
+        response.raise_for_status()
+        raise RuntimeError("Unexpected successful response without user data")
 
     def search_users(
         self,

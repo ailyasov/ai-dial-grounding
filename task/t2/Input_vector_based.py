@@ -134,7 +134,7 @@ async def main():
     #    I would recommend to set up dimensions as 384
     # 2. Create AzureChatOpenAI
 
-    #    chat model 'gpt-35-turbo'
+    #    chat model 'gpt-4o'
     #    I would recommend to set up temperature as 0.0
     embeddings = AzureOpenAIEmbeddings(
         deployment="text-embedding-3-small-1",
