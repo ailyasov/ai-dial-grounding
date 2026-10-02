@@ -1,10 +1,13 @@
 import asyncio
+import io
 import unittest
+from contextlib import redirect_stdout
 
+import httpx
 import requests
 from pydantic import ValidationError
 
-from task.t3.in_out_grounding import GroupingResult, OutputGrounder
+from task.t3.in_out_grounding import GroupingResult, GroupingResults, OutputGrounder
 from task.user_client import UserNotFoundError
 
 
@@ -22,6 +25,14 @@ class FakeUserClient:
 
 
 class OutputGrounderTests(unittest.TestCase):
+    @staticmethod
+    def _not_found_error(user_id):
+        request = httpx.Request("GET", f"http://users.test/v1/users/{user_id}")
+        response = httpx.Response(404, request=request)
+        return UserNotFoundError(
+            f"User {user_id} was not found", request=request, response=response
+        )
+
     def test_grouping_result_uses_integer_ids(self):
         result = GroupingResult(hobby="hiking", user_ids=["12", 13])
 
@@ -33,7 +44,7 @@ class OutputGrounderTests(unittest.TestCase):
         client = FakeUserClient(
             {
                 1: {"id": 1, "name": "Active"},
-                2: UserNotFoundError("User 2 was not found"),
+                2: self._not_found_error(2),
             }
         )
         grounder = OutputGrounder(client)
@@ -49,6 +60,24 @@ class OutputGrounderTests(unittest.TestCase):
 
         with self.assertRaisesRegex(requests.HTTPError, "503"):
             asyncio.run(OutputGrounder(client)._find_users([1]))
+
+    def test_ground_response_returns_and_prints_json(self):
+        client = FakeUserClient({1: {"id": 1, "name": "Ada"}})
+        grouping_results = GroupingResults(
+            grouping_results=[GroupingResult(hobby="hiking", user_ids=[1])]
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = asyncio.run(
+                OutputGrounder(client).ground_response(grouping_results)
+            )
+
+        self.assertEqual(result, {"hiking": [{"id": 1, "name": "Ada"}]})
+        self.assertEqual(
+            output.getvalue(),
+            '{\n  "hiking": [\n    {\n      "id": 1,\n      "name": "Ada"\n    }\n  ]\n}\n',
+        )
 
 
 if __name__ == "__main__":

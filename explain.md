@@ -208,26 +208,63 @@ want a context manager, the same lifecycle is a manual `try`/`await`/`finally`
 
 ### 3.4 A caveat visible in the code
 
-`async` only overlaps work that is *awaited*. Both T2 variants and T3 call
-some **synchronous** APIs from async contexts:
+`async` only overlaps work that is *awaited*. T2A and T2B still call some
+**synchronous** APIs from async contexts: their `UserClient` calls use
+`requests`, and their answer generation uses `.invoke(...)` rather than
+`await ...ainvoke(...)`. This is functional for the single-user scripts but
+blocks their event loops.
 
-- `UserClient` uses `requests`, which blocks the event loop while the HTTP
-  call runs.
-- T2A's and T2B's `generate_answer` and T3's `generate_answer` use the
-  synchronous `.invoke(...)` instead of `await ....ainvoke(...)`.
-- T3's `retrieve_context` uses the synchronous
-  `similarity_search_with_relevance_scores` instead of the `a`-prefixed
-  variant.
+T3's interactive path has been converted to non-blocking variants:
 
-This is functional for these single-user scripts, but it blocks concurrency.
-The most visible symptom is in T3's `OutputGrounder._find_users`: it builds an
-`asyncio.gather` over many `get_user` calls expecting concurrent fetches, but
-because `get_user` uses blocking `requests`, each call monopolises the event
-loop and they actually run **sequentially**. The gather is correct code whose
-speedup is silently cancelled by the blocking client. The async-friendly
-fixes are `httpx`/`aiohttp` for HTTP and `ainvoke`/`aadd_documents` for the
-LangChain clients (T1 already uses `ainvoke`; T2B/T3 already use async vector
-operations such as `FAISS.afrom_documents` and `Chroma.aadd_documents`).
+- `UserClient.aget_all_users` and `UserClient.get_user` use
+  `httpx.AsyncClient`;
+- Chroma retrieval uses
+  `await asimilarity_search_with_relevance_scores(...)`, deletion uses
+  `adelete(...)`, and its synchronous ID-listing API is moved to a worker
+  thread with `asyncio.to_thread(...)`;
+- generation uses `await (prompt | llm | parser).ainvoke(...)`.
+
+Therefore T3's `asyncio.gather(...)` can now overlap the individual profile
+HTTP requests. The older synchronous `get_all_users`, `search_users`, and
+`health` methods remain for the T1/T2 callers; T3 deliberately uses
+`aget_all_users` instead.
+
+#### What `await asyncio.to_thread(self.vectorstore.get)` does—and does not do
+
+T3 needs the current Chroma IDs before it can calculate the synchronization
+diff:
+
+```python
+existing_ids = set((await asyncio.to_thread(self.vectorstore.get))["ids"])
+ids_to_delete = existing_ids - current_user_ids
+new_user_ids = current_user_ids - existing_ids
+```
+
+The dependency is real: this particular `_update_vectorstore()` coroutine
+cannot calculate either difference until `get()` has finished. Moving
+`get()` to a thread does **not** make this step complete earlier, and it does
+not let the following lines run before `existing_ids` is available. When this
+is the only active coroutine, using a thread can even add a small scheduling
+overhead.
+
+The benefit is instead to the *event loop*, not to this data dependency.
+`Chroma.get()` is a synchronous, potentially I/O-bound API. Calling it
+directly inside an `async def` blocks the event loop: while it runs, no other
+coroutine can make progress. `asyncio.to_thread(...)` schedules that blocking
+call on a worker thread and returns an awaitable. At `await`, the current
+`_update_vectorstore()` coroutine pauses, but the event loop is free to run
+other independent work—such as other HTTP requests, another active
+conversation, timers, or background tasks. Once the worker finishes,
+`await` resumes and the expression obtains the normal dictionary returned by
+`vectorstore.get()`.
+
+In short: `to_thread` improves responsiveness and permits **independent**
+concurrent work; it cannot parallelize work that logically depends on
+`existing_ids`. It is used here because the installed Chroma integration
+offers async search and deletion methods but no async ID-listing (`aget`)
+method. If the application never has other work in the event loop during this
+short call, a direct synchronous `get()` would be simpler and have nearly the
+same elapsed time for this one synchronization step.
 
 ---
 
@@ -236,14 +273,58 @@ operations such as `FAISS.afrom_documents` and `Chroma.aadd_documents`).
 `UserClient` (`task/user_client.py`) exposes four methods, each raising on a
 non-200 response:
 
-- `get_all_users()` -- `GET /v1/users`, returns a list of user dicts.
+- `get_all_users()` -- synchronous `GET /v1/users`, retained for T1/T2;
+  returns a list of user dicts.
+- `aget_all_users()` -- asynchronous `GET /v1/users`, used by T3 so its
+  event loop is not blocked; returns the same list shape.
 - `search_users(name, surname, email, gender)` -- `GET /v1/users/search`;
   only non-`None` fields are sent as query parameters. The client supports
   `gender`, but T2A's schema does not expose it, so the LLM can never choose
   it.
-- `get_user(id)` -- `GET /v1/users/{id}`. Declared `async` but uses blocking
-  `requests` (see section 3.4).
+- `get_user(id)` -- asynchronous `GET /v1/users/{id}`, implemented with
+  `httpx.AsyncClient` (see section 3.4). A successful response whose JSON top level is
+  an object is returned as `dict[str, Any]`; its 404 case raises
+  `UserNotFoundError`, while other HTTP failures raise
+  `httpx.HTTPStatusError`.
 - `health()` -- `GET /health`.
+
+#### How `get_user()` becomes a Python dictionary
+
+`self.user_client.get_user(user_id)` does **not** return a JSON string on a
+successful request. It is an `async` function, so calling it first produces a
+coroutine; `_find_users` passes those coroutines to `asyncio.gather(...)`, and
+after `await` each successful result is the value returned by this code:
+
+```python
+response = await client.get(...)
+data = response.json()
+return data
+```
+
+The HTTP body itself is JSON text, for example:
+
+```json
+{"id": 42, "name": "Ada", "about_me": "I enjoy hiking"}
+```
+
+`response.json()` is a method provided by the third-party **HTTPX** library
+in T3 (Requests exposes a method with the same purpose for T1/T2). It decodes
+that JSON text into ordinary Python values: a JSON object becomes a `dict`, an
+array becomes a `list`, strings become `str`, numbers become `int` or
+`float`, `true` and `false` become `True` and `False`, and `null` becomes
+`None`. Therefore the example is returned approximately as:
+
+```python
+{"id": 42, "name": "Ada", "about_me": "I enjoy hiking"}
+```
+
+The annotation `-> dict[str, Any]` is a **type hint**, not a conversion
+feature. It documents the expected top-level shape for readers, type checkers
+and IDEs; it neither parses JSON nor validates a runtime response. The
+conversion happens specifically because the application calls
+`httpx.Response.json()` (or `requests.Response.json()` in the synchronous
+callers). If the service returned a top-level JSON array, the same method
+would instead return a Python `list`.
 
 The mock service generates users and, by design, **adds and deletes users
 every ~5 minutes**. This is not an arbitrary detail: it is what makes
@@ -888,7 +969,7 @@ be drowning in malformed outputs.
 ```python
 class GroupingResult(BaseModel):
     hobby: str
-    user_ids: list[str]
+    user_ids: list[int]
 
 class GroupingResults(BaseModel):
     grouping_results: list[GroupingResult]
@@ -927,9 +1008,9 @@ for raw search speed.
 
 ### 9.6 Current implementation status (verified against the code)
 
-T3 today is **runnable up to and including the LLM call**. An earlier
-revision of this guide listed twelve issues; the first five have since been
-fixed in `in_out_grounding.py`. What was fixed:
+T3 today is **runnable through output hydration and JSON response handoff**.
+An earlier revision of this guide listed twelve issues; the first eleven have
+since been fixed. What was fixed:
 
 1. `API_KEY` / `DIAL_URL` are imported from `task._constants` (the startup
    `NameError` is gone).
@@ -944,80 +1025,55 @@ fixed in `in_out_grounding.py`. What was fixed:
    the RAG context, that the output maps hobbies to user IDs, that only the
    provided context may be used, and that personal data must not be invented
    or rewritten.
-
-Point 5 of the old list therefore needs a verdict, since it was the item in
-question: it is **essentially resolved**. The only surviving residue is one
-phrase in `SYSTEM_PROMPT`: "Answer ONLY based on conversation history and RAG
-context" -- no conversation history exists anywhere in this app, and naming a
-data source the model never receives is at best confusing and at worst an
-invitation to invent one. Deleting "conversation history and" from that line
-is the last cleanup this item needs.
+   The obsolete "conversation history" wording has also been removed: the
+   prompt now names only the RAG context it actually receives.
+6. Model-client configuration now matches Phase 1.1: both API keys are
+   `SecretStr(API_KEY)`, the chat client uses `temperature=0.0`, and
+   embeddings use `dimensions=384` with
+   `check_embedding_ctx_length=False`.
+7. `GroupingResult.user_ids` is now `list[int]`. Pydantic validates the
+   structured model output before hydration, and `_find_users` also
+   defensively skips an invalid direct-call value before it can prevent
+   `asyncio.gather(...)` from being created.
+8. Output hydration now distinguishes an expected deleted-user response from
+   a real failure. `UserClient.get_user` turns a 404 into
+   `UserNotFoundError`; `_find_users` logs and skips it, but re-raises network
+   and non-404 HTTP failures. A successful `get_user` returns a Python
+   `dict`, not JSON text, because HTTPX's `response.json()` parses the HTTP
+   JSON body (see section 4).
+9. `ground_response` now builds and returns
+   `dict[str, list[dict[str, Any]]]`, and prints the same value with
+   `json.dumps(..., indent=2)`. The interactive output is valid, readable
+   JSON rather than Python's dict representation.
+10. The interactive loop now has a no-context path, one structured-output
+    repair retry after `OutputParserException`, a friendly no-match result if
+    that retry also fails, and logged continuation after any other request
+    error.
+11. T3 no longer performs its HTTP retrieval, vector search, or model
+    invocation synchronously in the event loop. It uses HTTPX async calls,
+    Chroma's async search/delete methods, `asyncio.to_thread` for Chroma's
+    sync-only ID lookup, and LCEL's `ainvoke`, so profile hydration can truly
+    overlap its HTTP requests.
 
 The remaining issues, in the order they bite (numbering continues from the
 old list, so the numbers match older notes and TODOs):
 
-6. **Client config deviates from the spec** (`main()` vs docstring Phase 1.1).
-   The chat model lacks `temperature=0.0` -- determinism matters for
-   extraction, where you want the same context to produce the same grouping.
-   The embeddings lack `dimensions=384` and
-   `check_embedding_ctx_length=False`, and the API key is not wrapped in
-   `SecretStr`.
-7. **`user_ids: list[str]` vs the spec's `list[int]`** (`GroupingResult`,
-   `_find_users`). `_find_users` calls `int(user_id)` while building the
-   task list, i.e. *before* `asyncio.gather` -- a non-numeric ID from the
-   LLM raises `ValueError` there and crashes the whole loop, even though
-   `gather(..., return_exceptions=True)` was added precisely to survive bad
-   items.
-8. **`_find_users` cannot tell "missing" from "broken"** (`OutputGrounder`).
-   Every exception (404, network error, 5xx) is printed and skipped. Per the
-   spec, a 404 is *expected* -- the user was deleted between indexing and
-   hydration, exactly what output grounding is designed to absorb -- and
-   should be handled quietly, while real failures should surface. Today a
-   total service outage silently looks like "no users found".
-9. **`ground_response` only prints** (`OutputGrounder`). It prints a Python
-   dict repr, not the promised JSON, and returns nothing -- so `main()`
-   cannot use, log or test the final grounded result.
-10. **No failure handling in the loop** (`main()`). An `OutputParserException`
-    (malformed LLM output) or an empty retrieval result crashes the loop or
-    degrades silently; there is no retry and no "no matches found" path.
-11. **Sync calls inside async code** (throughout). `UserClient` uses blocking
-    `requests` (so the `gather` over `get_user` actually runs sequentially --
-    see section 3.4), and `similarity_search_with_relevance_scores` and
-    `.invoke` are the sync variants. Functional for one user, but the claimed
-    concurrency is illusory.
 12. **No `persist_directory`** (`initialize_vectorstore`). `Chroma` defaults
     to an in-memory client, so the index is rebuilt and fully re-embedded on
     every run -- contradicting the stated cost goal quoted in section 9.2.
 
-**Step-by-step guide to finishing T3** -- steps 1-5 of the old guide are done
-and removed; the steps below are what remains, in order:
+**Step-by-step guide to finishing T3** -- all correctness and resilience
+steps are complete. The remaining work is:
 
-1. **Align the client config with the spec.** `temperature=0.0` on the chat
-   model; `dimensions=384` and `check_embedding_ctx_length=False` on the
-   embeddings; wrap the key with `SecretStr(API_KEY)`.
-2. **Harden output grounding.** Match the spec types (`user_ids: list[int]`);
-   in `_find_users`, validate/convert IDs defensively *before* building the
-   gather list (so a bad ID is skipped, not fatal), catch HTTP 404 separately
-   as "user deleted" (log info, skip) and let real errors surface; in
-   `ground_response`, build the `{hobby: [full user JSON]}` dict and
-   **return** it (print `json.dumps(...)` for readability).
-3. **Add failure handling in the loop.** Wrap the pipeline in try/except:
-   `OutputParserException` -> one repair retry or a friendly "no matches
-   found"; empty context (empty string from `retrieve_context`) -> skip the
-   LLM call and say no matches; unexpected errors -> log and continue the
-   loop. Also delete the "conversation history" phrase from `SYSTEM_PROMPT`
-   (section 9.6, point 5 verdict).
-4. **Optional production polish.** Pass `persist_directory` to `Chroma` so
-   the index survives restarts; switch to `asimilarity_search_with_relevance_scores`
-   / `ainvoke` / an async HTTP client so concurrency is real; add token
-   tracking like T1.
-5. **Verify end to end.** Start the mock service (`docker-compose up -d`),
+1. **Optional production polish.** Pass `persist_directory` to `Chroma` so
+   the index survives restarts; add token tracking like T1.
+2. **Verify end to end.** Start the mock service (`docker-compose up -d`),
    run the script, and check: cold-start indexing; a query like "I need
    people who love to go to mountains" returns grouped profiles; a 5-minute
    wait then re-query shows the sync step adding/removing users; a
    nonexistent-user ID is dropped without crashing.
 
-Steps 1-3 are required for a robust app; step 4 is quality; step 5 proves it.
+Step 1 is quality; step 2 proves the app end to end.
 
 ---
 

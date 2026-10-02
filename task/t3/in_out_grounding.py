@@ -1,9 +1,11 @@
 import asyncio
+import json
 import logging
 from typing import Any
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
+from langchain_core.exceptions import OutputParserException
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
@@ -95,14 +97,14 @@ logger = logging.getLogger(__name__)
 ### Phase 3: Input Grounder Implementation
 - [ ] **3.1 Asynchronous Context Management & VectorStore Initialization**
   - Implement `InputGrounder.__aenter__` and `initialize_vectorstore(batch_size=50)`:
-    - Fetch all users from UserService via `user_client.get_all_users()`.
+    - Fetch all users from UserService via `await user_client.aget_all_users()`.
     - Create `Document(id=str(user["id"]), page_content=format_user_document(user))`.
     - Chunk documents into batches (e.g. 50 items) to respect embedding rate limits.
     - Instantiate `Chroma(collection_name="users", embedding_function=self.embeddings)`.
     - Asynchronously ingest batches with `asyncio.gather(*[vectorstore.aadd_documents(batch) ...])`.
 - [ ] **3.2 Implement VectorStore Incremental Synchronization**
   - Implement `InputGrounder._update_vectorstore()`:
-    - Query live users: `users = self.user_client.get_all_users()`.
+    - Query live users: `users = await self.user_client.aget_all_users()`.
     - Retrieve existing IDs in Chroma: `vectorstore.get()["ids"]`.
     - Compute diff:
       - `ids_to_delete = vectorstore_ids - current_user_ids`
@@ -112,7 +114,7 @@ logger = logging.getLogger(__name__)
 - [ ] **3.3 Implement Semantic Retrieval & Relevance Filtering**
   - Implement `InputGrounder.retrieve_context(query: str, k: int = 100, score: float = 0.2) -> str`:
     - Trigger `_update_vectorstore()` to ensure cache freshness.
-    - Execute `similarity_search_with_relevance_scores(query, k=k, score_threshold=score)`.
+    - Execute `await asimilarity_search_with_relevance_scores(query, k=k)`.
     - Collect matching documents' `page_content`.
     - Join contexts with `\n\n`.
 - [ ] **3.4 Implement Prompt Augmentation & Generation**
@@ -120,7 +122,7 @@ logger = logging.getLogger(__name__)
     - Populate `USER_PROMPT` with `{context}` and `{query}`.
   - Implement `InputGrounder.generate_answer(augmented_prompt: str) -> GroupingResults`:
     - Construct `ChatPromptTemplate` with `SYSTEM_PROMPT` (partialed with `format_instructions`) and user message.
-    - Execute LCEL pipeline: `(prompt | llm_client | parser).invoke({})`.
+    - Execute LCEL pipeline: `await (prompt | llm_client | parser).ainvoke({})`.
     - Return validated `GroupingResults`.
 
 ### Phase 4: Output API Grounding Implementation
@@ -143,7 +145,7 @@ logger = logging.getLogger(__name__)
     - On input:
       1. `context = await rag.retrieve_context(user_question)`
       2. `augmented_prompt = rag.augment_prompt(user_question, context)`
-      3. `grouping_results = rag.generate_answer(augmented_prompt)`
+      3. `grouping_results = await rag.generate_answer(augmented_prompt)`
       4. `await output_grounder.ground_response(grouping_results)`
     - Handle termination commands (`quit`, `exit`).
 
@@ -178,6 +180,12 @@ USER_PROMPT = """
 {context}
 User QUESTION:
 {query}
+"""
+
+REPAIR_PROMPT = """
+Your previous answer could not be parsed. Return the answer again using only the
+required JSON schema and the supplied RAG context. Do not include prose,
+Markdown fences, or any fields outside that schema.
 """
 
 
@@ -221,7 +229,7 @@ class InputGrounder:
     async def initialize_vectorstore(self, batch_size: int = 50):
         """Initialize vectorstore with all users."""
         print("🔎 Loading all users...")
-        users = self.user_client.get_all_users()
+        users = await self.user_client.aget_all_users()
         documents = [
             Document(id=str(user["id"]), page_content=format_user_document(user))
             for user in users
@@ -239,9 +247,9 @@ class InputGrounder:
         """Update vectorstore with new and removed users."""
         if not self.vectorstore:
             raise ValueError("Vectorstore is not initialized.")
-        current_users = self.user_client.get_all_users()
+        current_users = await self.user_client.aget_all_users()
         current_user_ids = {str(user["id"]) for user in current_users}
-        existing_ids = set(self.vectorstore.get()["ids"])
+        existing_ids = set((await asyncio.to_thread(self.vectorstore.get))["ids"])
 
         # Identify users to delete and add
         ids_to_delete = existing_ids - current_user_ids
@@ -249,7 +257,7 @@ class InputGrounder:
 
         # Delete removed users
         if ids_to_delete:
-            self.vectorstore.delete(list(ids_to_delete))
+            await self.vectorstore.adelete(list(ids_to_delete))
 
         # Add new users
         if new_user_ids:
@@ -274,7 +282,7 @@ class InputGrounder:
             raise ValueError("Vectorstore is not initialized.")
         # Update vectorstore to ensure it's up-to-date
         await self._update_vectorstore()
-        relevant_docs = self.vectorstore.similarity_search_with_relevance_scores(
+        relevant_docs = await self.vectorstore.asimilarity_search_with_relevance_scores(
             query, k=k
         )
         context_parts = []
@@ -290,16 +298,22 @@ class InputGrounder:
         print(f"Augmented prompt:\n{augmented_prompt}")
         return augmented_prompt
 
-    def generate_answer(self, augmented_prompt: str) -> GroupingResults:
-        """Generate answer using the augmented prompt."""
+    async def generate_answer(
+        self, augmented_prompt: str, *, repair: bool = False
+    ) -> GroupingResults:
+        """Generate and validate structured output, optionally requesting a repair."""
         parser = PydanticOutputParser(pydantic_object=GroupingResults)
+        if repair:
+            augmented_prompt = f"{augmented_prompt}\n\n{REPAIR_PROMPT}"
         prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", SYSTEM_PROMPT),
                 ("human", "{augmented_prompt}"),
             ]
         ).partial(format_instructions=parser.get_format_instructions())
-        grouping_results: GroupingResults = (prompt | self.llm_client | parser).invoke(
+        grouping_results: GroupingResults = await (
+            prompt | self.llm_client | parser
+        ).ainvoke(
             {"augmented_prompt": augmented_prompt}
         )
         return grouping_results
@@ -350,14 +364,16 @@ class OutputGrounder:
                 users.append(result)
         return users
 
-    async def ground_response(self, grouping_results: GroupingResults):
-        """Ground the response by fetching full user info."""
-        grounded_results = {}
+    async def ground_response(
+        self, grouping_results: GroupingResults
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Fetch, print as JSON, and return authoritative user profiles by hobby."""
+        grounded_results: dict[str, list[dict[str, Any]]] = {}
         for grouping_result in grouping_results.grouping_results:
             users = await self._find_users(grouping_result.user_ids)
             grounded_results[grouping_result.hobby] = users
-        print("Grounded Results:")
-        print(grounded_results)
+        print(json.dumps(grounded_results, ensure_ascii=False, indent=2))
+        return grounded_results
 
 
 async def main():
@@ -384,10 +400,30 @@ async def main():
             user_question = input("> ")
             if user_question.lower() in ["quit", "exit"]:
                 break
-            context = await rag.retrieve_context(user_question)
-            augmented_prompt = rag.augment_prompt(user_question, context)
-            grouping_results = rag.generate_answer(augmented_prompt)
-            await output_grounder.ground_response(grouping_results)
+            try:
+                context = await rag.retrieve_context(user_question)
+                if not context:
+                    print("No matches found.")
+                    continue
+
+                augmented_prompt = rag.augment_prompt(user_question, context)
+                try:
+                    grouping_results = await rag.generate_answer(augmented_prompt)
+                except OutputParserException:
+                    logger.warning(
+                        "Model response was malformed; retrying once with repair instructions."
+                    )
+                    grouping_results = await rag.generate_answer(
+                        augmented_prompt, repair=True
+                    )
+
+                await output_grounder.ground_response(grouping_results)
+            except OutputParserException:
+                logger.warning("Model response was malformed after one repair attempt.")
+                print("No matches found.")
+            except Exception:
+                logger.exception("Unable to process the user request.")
+                print("Unable to process the request. Please try again.")
 
 
 if __name__ == "__main__":

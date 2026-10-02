@@ -1,11 +1,12 @@
 from typing import Any
 
+import httpx
 import requests
 
 from task._constants import USER_SERVICE_ENDPOINT
 
 
-class UserNotFoundError(requests.HTTPError):
+class UserNotFoundError(httpx.HTTPStatusError):
     """Raised when a requested user no longer exists in the User Service."""
 
 
@@ -24,24 +25,37 @@ class UserClient:
 
         raise Exception(f"HTTP {response.status_code}: {response.text}")
 
-    async def get_user(self, id: int) -> dict[str, Any]:
+    async def aget_all_users(self) -> list[dict[str, Any]]:
+        """Asynchronously fetch all users for callers that run in an event loop."""
         headers = {"Content-Type": "application/json"}
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                url=USER_SERVICE_ENDPOINT + "/v1/users", headers=headers
+            )
+            response.raise_for_status()
+        data: list[dict[str, Any]] = response.json()
+        print(f"Get {len(data)} users successfully")
+        return data
 
-        response = requests.get(
-            url=f"{USER_SERVICE_ENDPOINT}/v1/users/{id}", headers=headers
-        )
-
-        if response.status_code == 200:
-            data = response.json()
-            return data
-
-        if response.status_code == 404:
-            error = UserNotFoundError(f"User {id} was not found")
-            error.response = response
-            raise error
-
-        response.raise_for_status()
-        raise RuntimeError("Unexpected successful response without user data")
+    async def get_user(self, id: int) -> dict[str, Any]:
+        """Asynchronously fetch one user, treating a 404 as an expected absence."""
+        headers = {"Content-Type": "application/json"}
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                url=f"{USER_SERVICE_ENDPOINT}/v1/users/{id}", headers=headers
+            )
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                if response.status_code == 404:
+                    raise UserNotFoundError(
+                        f"User {id} was not found",
+                        request=error.request,
+                        response=error.response,
+                    ) from error
+                raise
+        data: dict[str, Any] = response.json()
+        return data
 
     def search_users(
         self,
